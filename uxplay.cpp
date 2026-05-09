@@ -177,6 +177,7 @@ static bool h265_support = false;
 static int n_video_renderers = 0;
 static int n_audio_renderers = 0;
 static bool hls_support = false;
+static time_t hls_video_play_time = 0;
 static std::string lang = "";
 static std::string url = "";
 static guint gst_x11_window_id = 0;
@@ -2594,6 +2595,7 @@ extern "C" void on_video_play(void *cls, const char* location, const float start
     url.append(location);
     relaunch_video = true;
     preserve_connections = true;
+    hls_video_play_time = time(NULL);
     LOGI("********************on_video_play: location = %s*** start position %f ********************", url.c_str(), start_position);
     video_reset(cls, RESET_TYPE_ON_VIDEO_PLAY);
 }
@@ -2607,9 +2609,13 @@ extern "C" void on_video_rate(void *cls, const float rate) {
     LOGI("on_video_rate = %7.5f\n", rate);
     if (rate == 1.0f) {
         video_renderer_resume();
-    } else if (rate ==  0.0f) {
-        video_renderer_pause();
-    } else  {
+    } else if (rate == 0.0f) {
+        if (hls_support && !url.empty() && (time(NULL) - hls_video_play_time) < 5) {
+            LOGI("on_video_rate: ignoring rate=0 within 5s of HLS video start\n");
+        } else {
+            video_renderer_pause();
+        }
+    } else {
         LOGI("on_video_rate: ignoring unexpected value rate = %f\n", rate);
     }
 }

@@ -18,6 +18,7 @@
 
 #include "airplay_video.h"
 #include "fcup_request.h"
+#include <pthread.h>
 
 static void
 *hls_get_current_video(raop_t *raop) {
@@ -720,6 +721,156 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
 
 }
 
+
+typedef struct {
+    raop_t *raop;
+    airplay_video_t *airplay_video;
+    char *playback_location;
+    char *apple_session_id;
+} direct_fetch_ctx_t;
+
+static char *fetch_url_direct(raop_t *raop, const char *url, int *datalen) {
+    char cmd[8192];
+    snprintf(cmd, sizeof(cmd), "curl -sL --max-time 15 \"%s\"", url);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) {
+        logger_log(raop->logger, LOGGER_ERR, "fetch_url_direct: popen failed");
+        return NULL;
+    }
+    size_t size = 0, cap = 65536;
+    char *buf = malloc(cap + 1);
+    if (!buf) { pclose(fp); return NULL; }
+    size_t n;
+    while ((n = fread(buf + size, 1, cap - size - 1, fp)) > 0) {
+        size += n;
+        if (size >= cap / 2) {
+            cap *= 2;
+            char *tmp = realloc(buf, cap + 1);
+            if (!tmp) { free(buf); pclose(fp); return NULL; }
+            buf = tmp;
+        }
+    }
+    pclose(fp);
+    buf[size] = '\0';
+    *datalen = (int) size;
+    return buf;
+}
+
+
+static char *absolutize_media_playlist(const char *media_url, const char *playlist) {
+    const char *last_slash = strrchr(media_url, '/');
+    if (!last_slash) return strdup(playlist);
+    size_t base_len = (size_t)(last_slash - media_url) + 1;
+    char *base = (char *) malloc(base_len + 1);
+    if (!base) return strdup(playlist);
+    memcpy(base, media_url, base_len);
+    base[base_len] = '\0';
+
+    size_t out_cap = strlen(playlist) * 4 + 1024;
+    char *out = (char *) malloc(out_cap);
+    if (!out) { free(base); return strdup(playlist); }
+    out[0] = '\0';
+    size_t out_len = 0;
+
+    const char *p = playlist;
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        size_t line_len = nl ? (size_t)(nl - p) : strlen(p);
+        size_t clean_len = line_len;
+        if (clean_len > 0 && p[clean_len - 1] == '\r') clean_len--;
+
+        int is_tag   = (clean_len > 0 && p[0] == '#');
+        int is_abs   = (clean_len > 4 && (strncmp(p, "http", 4) == 0 || p[0] == '/'));
+        int is_blank = (clean_len == 0);
+
+        size_t prefix_len = (!is_tag && !is_abs && !is_blank) ? base_len : 0;
+        size_t need = out_len + prefix_len + line_len + 2;
+        if (need > out_cap) {
+            out_cap = need * 2;
+            char *tmp = (char *) realloc(out, out_cap);
+            if (!tmp) break;
+            out = tmp;
+        }
+        if (prefix_len) {
+            memcpy(out + out_len, base, prefix_len);
+            out_len += prefix_len;
+        }
+        memcpy(out + out_len, p, line_len);
+        out_len += line_len;
+        out[out_len++] = '\n';
+        out[out_len]   = '\0';
+
+        p += line_len;
+        if (nl) p++;
+    }
+    free(base);
+    return out;
+}
+
+static void *direct_hls_fetch_thread(void *arg) {
+    direct_fetch_ctx_t *ctx = (direct_fetch_ctx_t *) arg;
+    raop_t *raop = ctx->raop;
+    airplay_video_t *airplay_video = ctx->airplay_video;
+    char *playback_location = ctx->playback_location;
+    char *apple_session_id = ctx->apple_session_id;
+    free(ctx);
+
+    logger_log(raop->logger, LOGGER_INFO, "direct_hls_fetch: fetching master playlist");
+    int datalen = 0;
+    char *playlist = fetch_url_direct(raop, playback_location, &datalen);
+    free(apple_session_id);
+    if (!playlist || datalen == 0) {
+        free(playback_location);
+        logger_log(raop->logger, LOGGER_ERR, "direct_hls_fetch: failed to fetch master playlist");
+        return NULL;
+    }
+
+    const char *uri_prefix = get_uri_prefix(airplay_video);
+    char *uri_local_prefix = get_uri_local_prefix(airplay_video);
+    char **uri_list = NULL;
+    int num_uri = 0;
+    playlist = select_master_playlist_language(airplay_video, playlist);
+    /* absolutize relative variant URLs so create_media_uri_table and adjust_master_playlist
+       can find the uri_prefix (YouTube uses absolute URLs already; Plex uses relative paths) */
+    char *abs_playlist = absolutize_media_playlist(playback_location, playlist);
+    free(playback_location);
+    free(playlist);
+    playlist = abs_playlist;
+    int playlist_len = strlen(playlist);
+    create_media_uri_table(uri_prefix, playlist, playlist_len, &uri_list, &num_uri);
+    char *new_master = adjust_master_playlist(playlist, playlist_len, uri_prefix, uri_local_prefix);
+    free(playlist);
+    store_master_playlist(airplay_video, new_master);
+    create_media_data_store(airplay_video, uri_list, num_uri);
+    free(uri_list);
+    set_next_media_uri_id(airplay_video, 0);
+    num_uri = get_num_media_uri(airplay_video);
+    logger_log(raop->logger, LOGGER_INFO, "direct_hls_fetch: master has %d media URIs", num_uri);
+
+    for (int uri_num = 0; uri_num < num_uri; uri_num++) {
+        const char *media_url = get_media_uri_by_num(airplay_video, uri_num);
+        if (!media_url) continue;
+        char *media_playlist_raw = fetch_url_direct(raop, media_url, &datalen);
+        if (!media_playlist_raw) continue;
+        /* rewrite relative segment URLs to absolute — Plex uses bare filenames like 00000.ts */
+        char *media_playlist = absolutize_media_playlist(media_url, media_playlist_raw);
+        free(media_playlist_raw);
+        float duration = 0.0f;
+        bool endlist = false;
+        int count = analyze_media_playlist(media_playlist, &duration, &endlist);
+        set_next_media_uri_id(airplay_video, uri_num);
+        store_media_playlist(airplay_video, media_playlist, &count, &duration, &endlist, uri_num);
+        logger_log(raop->logger, LOGGER_INFO, "direct_hls_fetch: media %d: %d chunks, %.1fs, endlist=%d",
+                   uri_num, count, duration, (int) endlist);
+    }
+
+    logger_log(raop->logger, LOGGER_INFO, "direct_hls_fetch: calling on_video_play");
+    raop->callbacks.on_video_play(raop->callbacks.cls,
+                                   get_playback_location(airplay_video),
+                                   get_start_position_seconds(airplay_video));
+    return NULL;
+}
+
 /* The POST /play request from the Client to Server on the AirPlay http channel contains (among other information)
    the "Content Location" that specifies the HLS Playlists for the video to be streamed, as well as the video 
    "start position in seconds".   Once this request is received by the Sever, the Server sends a POST /event
@@ -734,8 +885,9 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
     plist_t req_root_node = NULL;
     float start_position_seconds = 0.0f;
     bool data_is_binary_plist = false;
-    char supported_hls_proc_names[] = "YouTube;";
+    char supported_hls_proc_names[] = "YouTube;Plex;";
     airplay_video_t *airplay_video = NULL;
+    bool use_direct_fetch = false;
     
     logger_log(raop->logger, LOGGER_DEBUG, "http_handler_play");
 
@@ -870,6 +1022,7 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
         goto play_error;
     } else {
         plist_get_string_val(req_client_proc_name_node, &client_proc_name);
+        use_direct_fetch = (strcmp(client_proc_name, "YouTube") != 0);
         if (!strstr(supported_hls_proc_names, client_proc_name)){
             logger_log(raop->logger, LOGGER_WARNING, "Unsupported HLS streaming format: clientProcName %s not found in supported list: %s",
                        client_proc_name, supported_hls_proc_names);
@@ -889,18 +1042,20 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
 
     /* we only support HLS if the playback location is terminated by "/master.m3u8" */
     const char *uri_suffix = strstr(playback_location, "/master.m3u8");
+    if (!uri_suffix) uri_suffix = strstr(playback_location, "/start.m3u8");
     if (!uri_suffix) { 
         logger_log(raop->logger, LOGGER_ERR, "Content-Location has unsupported form:\n%s\n", playback_location);	    
         goto play_error;
     } else {
-        size_t len = strlen(get_uri_local_prefix(airplay_video)) + strlen(uri_suffix);
+        const char *local_path = "/master.m3u8";
+        size_t len = strlen(get_uri_local_prefix(airplay_video)) + strlen(local_path);
         char *location = (char *) calloc(len + 1, sizeof(char));
         if (!location) {
             printf("Memory allocation failed (location)\n");
             exit(1);
         }
         strcat(location, get_uri_local_prefix(airplay_video));
-        strcat(location, uri_suffix);
+        strcat(location, local_path);
         set_playback_location(airplay_video, location, strlen(location));
         free(location);
         char *uri_prefix = (char *) calloc(strlen(playback_location) + 1, sizeof(char));
@@ -910,12 +1065,24 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
         }
         strcat(uri_prefix, playback_location);
         char *end = strstr(uri_prefix, "/master.m3u8");
+        if (!end) end = strstr(uri_prefix, "/start.m3u8");
         *end = '\0';						  
         set_uri_prefix(airplay_video, uri_prefix, strlen(uri_prefix));
         free (uri_prefix);
     }
     set_next_media_uri_id(airplay_video, 0);
-    fcup_request((void *) conn, playback_location, apple_session_id, get_next_FCUP_RequestID(airplay_video));
+    if (use_direct_fetch) {
+        direct_fetch_ctx_t *dctx = malloc(sizeof(direct_fetch_ctx_t));
+        dctx->raop = raop;
+        dctx->airplay_video = airplay_video;
+        dctx->playback_location = strdup(playback_location);
+        dctx->apple_session_id = strdup(apple_session_id);
+        pthread_t dthread;
+        pthread_create(&dthread, NULL, direct_hls_fetch_thread, dctx);
+        pthread_detach(dthread);
+    } else {
+        fcup_request((void *) conn, playback_location, apple_session_id, get_next_FCUP_RequestID(airplay_video));
+    }
 
     plist_mem_free(playback_location);
 
