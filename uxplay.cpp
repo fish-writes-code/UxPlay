@@ -178,6 +178,7 @@ static int n_video_renderers = 0;
 static int n_audio_renderers = 0;
 static bool hls_support = false;
 static time_t hls_video_play_time = 0;
+static bool hls_resume_pending = false;
 static std::string lang = "";
 static std::string url = "";
 static guint gst_x11_window_id = 0;
@@ -655,6 +656,14 @@ static gboolean progress_callback (gpointer loop) {
     }
 }
 
+static gboolean hls_resume_callback(gpointer data) {
+    if (hls_resume_pending) {
+        video_renderer_resume();
+        hls_resume_pending = false;
+    }
+    return FALSE;
+}
+
 static gboolean video_eos_watch_callback (gpointer loop) {
     if (video_renderer_eos_watch()) {
         /* HLS video has sent EOS */
@@ -696,6 +705,9 @@ static void main_loop()  {
             url.erase();
             video_eos_watch_id = g_timeout_add(100, (GSourceFunc) video_eos_watch_callback, (gpointer) loop);
             gst_x11_window_id = g_timeout_add(100, (GSourceFunc) x11_window_callback, (gpointer) loop);
+            if (hls_resume_pending) {
+                g_timeout_add(600, (GSourceFunc) hls_resume_callback, NULL);
+            }
         }
         g_assert(n_video_renderers <= MAX_VIDEO_RENDERERS);
         for (int i = 0; i < n_video_renderers; i++) {
@@ -2608,7 +2620,12 @@ extern "C" void on_video_scrub(void *cls, const float position) {
 extern "C" void on_video_rate(void *cls, const float rate) {
     LOGI("on_video_rate = %7.5f\n", rate);
     if (rate == 1.0f) {
-        video_renderer_resume();
+        if (hls_support && (hls_video_play_time == 0 || (time(NULL) - hls_video_play_time) > 3)) {
+            LOGI("on_video_rate: rate=1 before pipeline ready, deferring resume\n");
+            hls_resume_pending = true;
+        } else {
+            video_renderer_resume();
+        }
     } else if (rate == 0.0f) {
         if (hls_support && !url.empty() && (time(NULL) - hls_video_play_time) < 5) {
             LOGI("on_video_rate: ignoring rate=0 within 5s of HLS video start\n");
@@ -3257,6 +3274,7 @@ int main (int argc, char *argv[]) {
                                 render_coverart, playbin_version, uri);
             full_video_reset = false;
             video_renderer_start();
+
         }
         if (reset_httpd) {
             unsigned short port = raop_get_port(raop);
